@@ -13,14 +13,14 @@ on:
       kernel_source:
         description: "Select the kernel source"
         required: false
-        default: "unifreq"
+        default: "unifreq/linux-5.4.y"
         type: choice
         options:
-          - unifreq
+          - unifreq/linux-5.4.y
       kernel_version:
         description: "Select kernel version"
         required: false
-        default: "5.15.1"
+        default: "5.4.1"
         type: choice
         options:
           - 5.4.1_5.10.1
@@ -100,6 +100,9 @@ jobs:
           kernel_package: ${{ inputs.kernel_package }}
           kernel_sign: ${{ inputs.kernel_sign }}
           kernel_toolchain: ${{ inputs.kernel_toolchain }}
+          auto_patch: true
+          kernel_patch: patch/redroid
+
 
       - name: Upload Kernel to Release
         uses: ncipollo/release-action@main
