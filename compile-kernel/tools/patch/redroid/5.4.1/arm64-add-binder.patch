@@ -1,0 +1,613 @@
+From b54aade3bd9fbd49c408f96c3d7718cc0e5b90b6 Mon Sep 17 00:00:00 2001
+From: zhouziyang <ziyang.zhou@outlook.com>
+Date: Sat, 21 May 2022 16:29:59 +0800
+Subject: [PATCH] init binder_linux module
+
+---
+ 5.4.195/binder/Makefile                      |  25 ++-
+ 5.4.195/binder/binder.c                      |  46 +++++-
+ 5.4.195/binder/binder_alloc.c                |   9 ++
+ 5.4.195/binder/binder_alloc.h                |   2 +-
+ 5.4.195/binder/binder_hack.h                 |  41 +++++
+ 5.4.195/binder/binderfs.c                    |  16 +-
+ 5.4.195/binder/deps.c                        | 155 +++++++++++++++++++
+ 5.4.195/binder/dkms.conf                     |   8 +
+ 5.4.195/binder/idr.c                         |  66 ++++++++
+ 5.4.195/binder/linux/fdtable.h               |   7 +
+ 5.4.195/binder/linux/idr.h                   |  25 +++
+ 5.4.195/binder/linux/xarray.h                |  24 +++
+ 5.4.195/binder/uapi/linux/android/binder.h   |   3 +
+ 5.4.195/binder/uapi/linux/android/binderfs.h |   2 +-
+ 14 files changed, 416 insertions(+), 13 deletions(-)
+ create mode 100644 5.4.195/binder/binder_hack.h
+ create mode 100644 5.4.195/binder/deps.c
+ create mode 100644 5.4.195/binder/dkms.conf
+ create mode 100644 5.4.195/binder/idr.c
+ create mode 100644 5.4.195/binder/linux/fdtable.h
+ create mode 100644 5.4.195/binder/linux/idr.h
+ create mode 100644 5.4.195/binder/linux/xarray.h
+
+diff --git a/5.4.195/binder/Makefile b/5.4.195/binder/Makefile
+index c9d3d0c..45c9a52 100644
+--- a/5.4.195/binder/Makefile
++++ b/5.4.195/binder/Makefile
+@@ -1,6 +1,21 @@
+-# SPDX-License-Identifier: GPL-2.0-only
+-ccflags-y += -I$(src)			# needed for trace events
++ccflags-y = -I$(src) -DREDROID -DCONFIG_ANDROID_BINDERFS
++obj-m := binder_linux.o
++binder_linux-y := binderfs.o binder.o binder_alloc.o idr.o deps.o
+
+-obj-$(CONFIG_ANDROID_BINDERFS)		+= binderfs.o
+-obj-$(CONFIG_ANDROID_BINDER_IPC)	+= binder.o binder_alloc.o
+-obj-$(CONFIG_ANDROID_BINDER_IPC_SELFTEST) += binder_alloc_selftest.o
++KDIR ?= /lib/modules/`uname -r`/build
++
++all:
++	$(MAKE) -C $(KDIR) M=$$PWD
++
++install: all
++	insmod binder_linux.ko
++
++modules_install:
++	$(MAKE) -C $(KDIR) M=$$PWD modules_install
++
++uninstall:
++	rmmod binder_linux
++
++clean:
++	$(MAKE) -C $(KDIR) M=$$PWD clean
++	rm *.o.*
+diff --git a/5.4.195/binder/binder.c b/5.4.195/binder/binder.c
+index b9fb2a9..961d23c 100644
+--- a/5.4.195/binder/binder.c
++++ b/5.4.195/binder/binder.c
+@@ -66,8 +66,8 @@
+ #include <linux/syscalls.h>
+ #include <linux/task_work.h>
+
+-#include <uapi/linux/android/binder.h>
+-#include <uapi/linux/android/binderfs.h>
++#include "uapi/linux/android/binder.h"
++#include "uapi/linux/android/binderfs.h"
+
+ #include <asm/cacheflush.h>
+
+@@ -75,6 +75,26 @@
+ #include "binder_internal.h"
+ #include "binder_trace.h"
+
++#ifdef REDROID
++#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 4, 165) || \
++        (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0) && \
++        LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 85))
++
++static inline void __wake_up_pollfree(struct wait_queue_head *wq_head)
++{
++        __wake_up(wq_head, TASK_NORMAL, 0, poll_to_key(EPOLLHUP | POLLFREE));
++        /* POLLFREE must have cleared the queue. */
++        WARN_ON_ONCE(waitqueue_active(wq_head));
++}
++
++static inline void wake_up_pollfree(struct wait_queue_head *wq_head)
++{
++        if (waitqueue_active(wq_head))
++                __wake_up_pollfree(wq_head);
++}
++#endif
++#endif // ifdef REDROID
++
+ static HLIST_HEAD(binder_deferred_list);
+ static DEFINE_MUTEX(binder_deferred_lock);
+
+@@ -6203,7 +6223,29 @@ static int __init binder_init(void)
+ 	return ret;
+ }
+
++#ifdef REDROID
++static void __exit binder_exit(void)
++{
++	struct binder_device *device;
++	struct hlist_node *tmp;
++
++	binderfs_exit();
++
++	hlist_for_each_entry_safe(device, tmp, &binder_devices, hlist) {
++		misc_deregister(&device->miscdev);
++		hlist_del(&device->hlist);
++		kfree(device);
++	}
++
++	debugfs_remove_recursive(binder_debugfs_dir_entry_root);
++
++	binder_alloc_shrinker_exit();
++}
++module_init(binder_init);
++module_exit(binder_exit);
++#else
+ device_initcall(binder_init);
++#endif
+
+ #define CREATE_TRACE_POINTS
+ #include "binder_trace.h"
+diff --git a/5.4.195/binder/binder_alloc.c b/5.4.195/binder/binder_alloc.c
+index b5022a7..1e72db8 100644
+--- a/5.4.195/binder/binder_alloc.c
++++ b/5.4.195/binder/binder_alloc.c
+@@ -38,8 +38,10 @@ enum {
+ };
+ static uint32_t binder_alloc_debug_mask = BINDER_DEBUG_USER_ERROR;
+
++#ifndef REDROID
+ module_param_named(debug_mask, binder_alloc_debug_mask,
+ 		   uint, 0644);
++#endif
+
+ #define binder_alloc_debug(mask, x...) \
+ 	do { \
+@@ -1037,6 +1039,13 @@ int binder_alloc_shrinker_init(void)
+ 	return ret;
+ }
+
++#ifdef REDROID
++void binder_alloc_shrinker_exit(void)
++{
++	unregister_shrinker(&binder_shrinker);
++	list_lru_destroy(&binder_alloc_lru);
++}
++#endif
+ /**
+  * check_buffer() - verify that buffer/offset is safe to access
+  * @alloc: binder_alloc for this proc
+diff --git a/5.4.195/binder/binder_alloc.h b/5.4.195/binder/binder_alloc.h
+index 288d0f4..1f6fcae 100644
+--- a/5.4.195/binder/binder_alloc.h
++++ b/5.4.195/binder/binder_alloc.h
+@@ -13,7 +13,7 @@
+ #include <linux/vmalloc.h>
+ #include <linux/slab.h>
+ #include <linux/list_lru.h>
+-#include <uapi/linux/android/binder.h>
++#include "uapi/linux/android/binder.h"
+
+ extern struct list_lru binder_alloc_lru;
+ struct binder_transaction;
+diff --git a/5.4.195/binder/binder_hack.h b/5.4.195/binder/binder_hack.h
+new file mode 100644
+index 0000000..1a2726e
+--- /dev/null
++++ b/5.4.195/binder/binder_hack.h
+@@ -0,0 +1,41 @@
++#ifndef REDROID_HACK_H
++#define REDROID_HACK_H
++
++#include <linux/version.h>
++
++#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 16, 0)
++#ifdef __CHECK_POLL
++typedef unsigned __bitwise __poll_t;
++#else
++typedef unsigned __poll_t;
++#endif
++#endif
++
++#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 17, 0)
++typedef int vm_fault_t;
++#endif
++
++#ifndef CONFIG_ANDROID_BINDER_DEVICES
++#define CONFIG_ANDROID_BINDER_DEVICES "binder,hwbinder,vndbinder"
++#endif
++
++extern void __exit binderfs_exit(void);
++extern void binder_alloc_shrinker_exit(void);
++extern struct ipc_namespace* get_init_ipc_ns_ptr(void);
++
++#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 16, 0)
++#define DEFINE_SHOW_ATTRIBUTE(__name)                                   \
++	static int __name ## _open(struct inode *inode, struct file *file)      \
++{                                                                       \
++	return single_open(file, __name ## _show, inode->i_private);    \
++}                                                                       \
++\
++static const struct file_operations __name ## _fops = {                 \
++	.owner          = THIS_MODULE,                                  \
++	.open           = __name ## _open,                              \
++	.read           = seq_read,                                     \
++	.llseek         = seq_lseek,                                    \
++	.release        = single_release,                               \
++}
++#endif
++#endif // REDROID_HACK_H
+diff --git a/5.4.195/binder/binderfs.c b/5.4.195/binder/binderfs.c
+index f303106..e8a0b4f 100644
+--- a/5.4.195/binder/binderfs.c
++++ b/5.4.195/binder/binderfs.c
+@@ -31,8 +31,8 @@
+ #include <linux/user_namespace.h>
+ #include <linux/xarray.h>
+ #include <uapi/asm-generic/errno-base.h>
+-#include <uapi/linux/android/binder.h>
+-#include <uapi/linux/android/binderfs.h>
++#include "uapi/linux/android/binder.h"
++#include "uapi/linux/android/binderfs.h"
+
+ #include "binder_internal.h"
+
+@@ -109,7 +109,7 @@ static int binderfs_binder_device_create(struct inode *ref_inode,
+ 	struct super_block *sb = ref_inode->i_sb;
+ 	struct binderfs_info *info = sb->s_fs_info;
+ #if defined(CONFIG_IPC_NS)
+-	bool use_reserve = (info->ipc_ns == &init_ipc_ns);
++	bool use_reserve = (info->ipc_ns == get_init_ipc_ns_ptr());
+ #else
+ 	bool use_reserve = true;
+ #endif
+@@ -408,7 +408,7 @@ static int binderfs_binder_ctl_create(struct super_block *sb)
+ 	struct dentry *root = sb->s_root;
+ 	struct binderfs_info *info = sb->s_fs_info;
+ #if defined(CONFIG_IPC_NS)
+-	bool use_reserve = (info->ipc_ns == &init_ipc_ns);
++	bool use_reserve = (info->ipc_ns == get_init_ipc_ns_ptr());
+ #else
+ 	bool use_reserve = true;
+ #endif
+@@ -792,3 +792,11 @@ int __init init_binderfs(void)
+
+ 	return ret;
+ }
++
++#ifdef REDROID
++void __exit binderfs_exit(void)
++{
++	unregister_filesystem(&binder_fs_type);
++	unregister_chrdev_region(binderfs_dev, BINDERFS_MAX_MINOR);
++}
++#endif
+diff --git a/5.4.195/binder/deps.c b/5.4.195/binder/deps.c
+new file mode 100644
+index 0000000..00098bf
+--- /dev/null
++++ b/5.4.195/binder/deps.c
+@@ -0,0 +1,155 @@
++#include <linux/sched.h>
++#include <linux/file.h>
++#include <linux/fdtable.h>
++#include <linux/atomic.h>
++#include <linux/mm.h>
++#include <linux/slab.h>
++#include <linux/spinlock.h>
++#include <linux/kallsyms.h>
++#include <linux/version.h>
++#include <linux/ipc_namespace.h>
++#include <linux/task_work.h>
++
++typedef void (*zap_page_range_ptr_t)(struct vm_area_struct *, unsigned long, unsigned long);
++static zap_page_range_ptr_t zap_page_range_ptr = NULL;
++void zap_page_range(struct vm_area_struct *vma, unsigned long address, unsigned long size)
++{
++	if (!zap_page_range_ptr)
++		zap_page_range_ptr = (zap_page_range_ptr_t) kallsyms_lookup_name("zap_page_range");
++	zap_page_range_ptr(vma, address, size);
++}
++
++typedef int (*can_nice_ptr_t)(const struct task_struct *, const int);
++static can_nice_ptr_t can_nice_ptr = NULL;
++int can_nice(const struct task_struct *p, const int nice)
++{
++	if (!can_nice_ptr)
++		can_nice_ptr = (can_nice_ptr_t) kallsyms_lookup_name("can_nice");
++	return can_nice_ptr(p, nice);
++}
++
++typedef int (*security_binder_set_context_mgr_ptr_t)(struct task_struct *mgr);
++security_binder_set_context_mgr_ptr_t security_binder_set_context_mgr_ptr = NULL;
++int security_binder_set_context_mgr(struct task_struct *mgr)
++{
++	if (!security_binder_set_context_mgr_ptr)
++		security_binder_set_context_mgr_ptr = (security_binder_set_context_mgr_ptr_t) kallsyms_lookup_name("security_binder_set_context_mgr");
++	return security_binder_set_context_mgr_ptr(mgr);
++}
++
++typedef int (*security_binder_transaction_ptr_t)(struct task_struct *from, struct task_struct *to);
++static security_binder_transaction_ptr_t security_binder_transaction_ptr = NULL;
++int security_binder_transaction(struct task_struct *from, struct task_struct *to)
++{
++	if (!security_binder_transaction_ptr)
++		security_binder_transaction_ptr = (security_binder_transaction_ptr_t) kallsyms_lookup_name("security_binder_transaction");
++	return security_binder_transaction_ptr(from, to);
++}
++
++typedef int (*security_binder_transfer_binder_ptr_t)(struct task_struct *from, struct task_struct *to);
++static security_binder_transfer_binder_ptr_t security_binder_transfer_binder_ptr = NULL;
++int security_binder_transfer_binder(struct task_struct *from, struct task_struct *to)
++{
++	if (!security_binder_transfer_binder_ptr)
++		security_binder_transfer_binder_ptr = (security_binder_transfer_binder_ptr_t) kallsyms_lookup_name("security_binder_transfer_binder");
++	return security_binder_transfer_binder_ptr(from, to);
++}
++
++typedef int (*security_binder_transfer_file_ptr_t)(struct task_struct *from, struct task_struct *to, struct file *file);
++static security_binder_transfer_file_ptr_t security_binder_transfer_file_ptr = NULL;
++int security_binder_transfer_file(struct task_struct *from, struct task_struct *to, struct file *file)
++{
++	if (!security_binder_transfer_file_ptr)
++		security_binder_transfer_file_ptr = (security_binder_transfer_file_ptr_t) kallsyms_lookup_name("security_binder_transfer_file");
++	return security_binder_transfer_file_ptr(from, to, file);
++}
++
++typedef void (*put_ipc_ns_ptr_t)(struct ipc_namespace *ns);
++static put_ipc_ns_ptr_t put_ipc_ns_ptr = NULL;
++void put_ipc_ns(struct ipc_namespace *ns)
++{
++    if (!put_ipc_ns_ptr)
++        put_ipc_ns_ptr = (put_ipc_ns_ptr_t) kallsyms_lookup_name("put_ipc_ns");
++    put_ipc_ns_ptr(ns);
++}
++
++// struct ipc_namespace init_ipc_ns;
++typedef struct ipc_namespace *init_ipc_ns_ptr_t;
++static init_ipc_ns_ptr_t init_ipc_ns_ptr = NULL;
++init_ipc_ns_ptr_t get_init_ipc_ns_ptr(void)
++{
++    if (!init_ipc_ns_ptr) init_ipc_ns_ptr = (init_ipc_ns_ptr_t) kallsyms_lookup_name("init_ipc_ns");
++    return init_ipc_ns_ptr;
++}
++
++typedef int (*task_work_add_ptr_t)(struct task_struct *task, struct callback_head *twork, enum task_work_notify_mode mode);
++static task_work_add_ptr_t task_work_add_ptr = NULL;
++int task_work_add(struct task_struct *task, struct callback_head *twork, enum task_work_notify_mode mode)
++{
++    if (!task_work_add_ptr)
++        task_work_add_ptr = (task_work_add_ptr_t) kallsyms_lookup_name("task_work_add");
++    return task_work_add_ptr(task, twork, mode);
++}
++
++typedef void (*mmput_async_ptr_t)(struct mm_struct *);
++static mmput_async_ptr_t mmput_async_ptr = NULL;
++void mmput_async(struct mm_struct *mm)
++{
++    if (!mmput_async_ptr)
++       mmput_async_ptr = (mmput_async_ptr_t) kallsyms_lookup_name("mmput_async");
++    mmput_async_ptr(mm);
++}
++
++#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 20, 1)
++static inline void __clear_open_fd(unsigned int fd, struct fdtable *fdt)
++{
++	__clear_bit(fd, fdt->open_fds);
++	__clear_bit(fd / BITS_PER_LONG, fdt->full_fds_bits);
++}
++
++static void __put_unused_fd(struct files_struct *files, unsigned int fd)
++{
++	struct fdtable *fdt = files_fdtable(files);
++	__clear_open_fd(fd, fdt);
++	if (fd < files->next_fd)
++		files->next_fd = fd;
++}
++
++int __close_fd_get_file(unsigned int fd, struct file **res)
++{
++	struct files_struct *files = current->files;
++	struct file *file;
++	struct fdtable *fdt;
++
++	spin_lock(&files->file_lock);
++	fdt = files_fdtable(files);
++	if (fd >= fdt->max_fds)
++		goto out_unlock;
++	file = fdt->fd[fd];
++	if (!file)
++		goto out_unlock;
++	rcu_assign_pointer(fdt->fd[fd], NULL);
++	__put_unused_fd(files, fd);
++	spin_unlock(&files->file_lock);
++	get_file(file);
++	*res = file;
++	return filp_close(file, files);
++
++out_unlock:
++	spin_unlock(&files->file_lock);
++	*res = NULL;
++	return -ENOENT;
++}
++#else
++typedef int (*__close_fd_get_file_ptr_t)(unsigned int fd, struct file **res);
++static __close_fd_get_file_ptr_t __close_fd_get_file_ptr = NULL;
++int __close_fd_get_file(unsigned int fd, struct file **res)
++{
++    if (!__close_fd_get_file_ptr)
++        __close_fd_get_file_ptr = (__close_fd_get_file_ptr_t) kallsyms_lookup_name("__close_fd_get_file");
++
++    return __close_fd_get_file_ptr(fd, res);
++
++}
++#endif // LINUX_VERSION_CODE < KERNEL_VERSION(4, 20, 1)
++
+diff --git a/5.4.195/binder/dkms.conf b/5.4.195/binder/dkms.conf
+new file mode 100644
+index 0000000..cd89b62
+--- /dev/null
++++ b/5.4.195/binder/dkms.conf
+@@ -0,0 +1,8 @@
++PACKAGE_NAME="redroid-binder"
++PACKAGE_VERSION="1"
++CLEAN="make clean"
++MAKE[0]="make all KERNEL_SRC=/lib/modules/$kernelver/build"
++BUILT_MODULE_NAME[0]="binder_linux"
++DEST_MODULE_LOCATION[0]="/updates"
++AUTOINSTALL="yes"
++
+diff --git a/5.4.195/binder/idr.c b/5.4.195/binder/idr.c
+new file mode 100644
+index 0000000..5ae8a61
+--- /dev/null
++++ b/5.4.195/binder/idr.c
+@@ -0,0 +1,66 @@
++#include <linux/version.h>
++#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 19, 0)
++#include "linux/idr.h"
++#include <linux/spinlock.h>
++#include <linux/xarray.h>
++/**
++ * ida_alloc_range() - Allocate an unused ID.
++ * @ida: IDA handle.
++ * @min: Lowest ID to allocate.
++ * @max: Highest ID to allocate.
++ * @gfp: Memory allocation flags.
++ *
++ * Allocate an ID between @min and @max, inclusive.  The allocated ID will
++ * not exceed %INT_MAX, even if @max is larger.
++ *
++ * Context: Any context.
++ * Return: The allocated ID, or %-ENOMEM if memory could not be allocated,
++ * or %-ENOSPC if there are no free IDs.
++ */
++int ida_alloc_range(struct ida *ida, unsigned int min, unsigned int max,
++			gfp_t gfp)
++{
++	int id = 0;
++	unsigned long flags;
++
++	if ((int)min < 0)
++		return -ENOSPC;
++
++	if ((int)max < 0)
++		max = INT_MAX;
++
++again:
++	xa_lock_irqsave(&ida->ida_rt, flags);
++	ida_get_new_above(ida, min, &id);
++	if (id > (int)max) {
++		ida_remove(ida, id);
++		id = -ENOSPC;
++	}
++	xa_unlock_irqrestore(&ida->ida_rt, flags);
++
++	if (unlikely(id == -EAGAIN)) {
++		if (!ida_pre_get(ida, gfp))
++			return -ENOMEM;
++		goto again;
++	}
++
++	return id;
++}
++
++/**
++ * ida_free() - Release an allocated ID.
++ * @ida: IDA handle.
++ * @id: Previously allocated ID.
++ *
++ * Context: Any context.
++ */
++void ida_free(struct ida *ida, unsigned int id)
++{
++	unsigned long flags;
++
++	BUG_ON((int)id < 0);
++	xa_lock_irqsave(&ida->ida_rt, flags);
++	ida_remove(ida, id);
++	xa_unlock_irqrestore(&ida->ida_rt, flags);
++}
++#endif
+diff --git a/5.4.195/binder/linux/fdtable.h b/5.4.195/binder/linux/fdtable.h
+new file mode 100644
+index 0000000..d97db92
+--- /dev/null
++++ b/5.4.195/binder/linux/fdtable.h
+@@ -0,0 +1,7 @@
++#include <linux/fdtable.h>
++
++#include <linux/version.h>
++#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 20, 1)
++extern int __close_fd_get_file(unsigned int fd, struct file **res);
++#endif
++
+diff --git a/5.4.195/binder/linux/idr.h b/5.4.195/binder/linux/idr.h
+new file mode 100644
+index 0000000..d994da4
+--- /dev/null
++++ b/5.4.195/binder/linux/idr.h
+@@ -0,0 +1,25 @@
++#include <linux/idr.h>
++
++#include <linux/version.h>
++#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 19, 0)
++int ida_alloc_range(struct ida *, unsigned int min, unsigned int max, gfp_t);
++void ida_free(struct ida *ida, unsigned int id);
++
++/**
++ * ida_alloc_max() - Allocate an unused ID.
++ * @ida: IDA handle.
++ * @max: Highest ID to allocate.
++ * @gfp: Memory allocation flags.
++ *
++ * Allocate an ID between 0 and @max, inclusive.
++ *
++ * Context: Any context.
++ * Return: The allocated ID, or %-ENOMEM if memory could not be allocated,
++ * or %-ENOSPC if there are no free IDs.
++ */
++static inline int ida_alloc_max(struct ida *ida, unsigned int max, gfp_t gfp)
++{
++	return ida_alloc_range(ida, 0, max, gfp);
++}
++
++#endif
+diff --git a/5.4.195/binder/linux/xarray.h b/5.4.195/binder/linux/xarray.h
+new file mode 100644
+index 0000000..f08db68
+--- /dev/null
++++ b/5.4.195/binder/linux/xarray.h
+@@ -0,0 +1,24 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++#ifndef _LINUX_XARRAY_H
++#define _LINUX_XARRAY_H
++/*
++ * eXtensible Arrays
++ * Copyright (c) 2017 Microsoft Corporation
++ * Author: Matthew Wilcox <mawilcox@microsoft.com>
++ */
++
++#include <linux/spinlock.h>
++
++#define xa_trylock(xa)		spin_trylock(&(xa)->xa_lock)
++#define xa_lock(xa)		spin_lock(&(xa)->xa_lock)
++#define xa_unlock(xa)		spin_unlock(&(xa)->xa_lock)
++#define xa_lock_bh(xa)		spin_lock_bh(&(xa)->xa_lock)
++#define xa_unlock_bh(xa)	spin_unlock_bh(&(xa)->xa_lock)
++#define xa_lock_irq(xa)		spin_lock_irq(&(xa)->xa_lock)
++#define xa_unlock_irq(xa)	spin_unlock_irq(&(xa)->xa_lock)
++#define xa_lock_irqsave(xa, flags)
++//				spin_lock_irqsave(&(xa)->xa_lock, flags)
++#define xa_unlock_irqrestore(xa, flags)
++//				spin_unlock_irqrestore(&(xa)->xa_lock, flags)
++
++#endif /* _LINUX_XARRAY_H */
+diff --git a/5.4.195/binder/uapi/linux/android/binder.h b/5.4.195/binder/uapi/linux/android/binder.h
+index 7317808..24d3671 100644
+--- a/5.4.195/binder/uapi/linux/android/binder.h
++++ b/5.4.195/binder/uapi/linux/android/binder.h
+@@ -23,6 +23,9 @@
+
+ #include <linux/types.h>
+ #include <linux/ioctl.h>
++#ifdef REDROID
++#include "binder_hack.h"
++#endif
+
+ #define B_PACK_CHARS(c1, c2, c3, c4) \
+ 	((((c1)<<24)) | (((c2)<<16)) | (((c3)<<8)) | (c4))
+diff --git a/5.4.195/binder/uapi/linux/android/binderfs.h b/5.4.195/binder/uapi/linux/android/binderfs.h
+index 8741047..cf9a8b0 100644
+--- a/5.4.195/binder/uapi/linux/android/binderfs.h
++++ b/5.4.195/binder/uapi/linux/android/binderfs.h
+@@ -7,7 +7,7 @@
+ #ifndef _UAPI_LINUX_BINDERFS_H
+ #define _UAPI_LINUX_BINDERFS_H
+
+-#include <linux/android/binder.h>
++#include "uapi/linux/android/binder.h"
+ #include <linux/types.h>
+ #include <linux/ioctl.h>
