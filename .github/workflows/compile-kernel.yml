@@ -54,11 +54,11 @@ on:
       kernel_sign:
         description: "Set the kernel custom signature"
         required: false
-        default: "-167-generic"
+        default: "-generic"
         type: choice
         options:
           - -ophub
-          - -167-generic
+          - -generic
 
 env:
   TZ: America/New_York
