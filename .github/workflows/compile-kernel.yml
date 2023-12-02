@@ -20,12 +20,13 @@ on:
       kernel_version:
         description: "Select kernel version"
         required: false
-        default: "5.4.1"
+        default: "5.4.0"
         type: choice
         options:
           - 5.4.1_5.10.1
           - 5.15.1_6.1.1
           - 5.4.1
+          - 5.4.0
           - 5.10.1
           - 5.15.1
           - 6.1.1
@@ -53,11 +54,11 @@ on:
       kernel_sign:
         description: "Set the kernel custom signature"
         required: false
-        default: "-lover"
+        default: "-167-generic"
         type: choice
         options:
           - -ophub
-          - -lover
+          - -167-generic
 
 env:
   TZ: America/New_York
@@ -101,7 +102,7 @@ jobs:
           kernel_sign: ${{ inputs.kernel_sign }}
           kernel_toolchain: ${{ inputs.kernel_toolchain }}
           auto_patch: true
-          kernel_patch: patch/redroid
+          #kernel_patch: patch/redroid
 
 
       - name: Upload Kernel to Release
