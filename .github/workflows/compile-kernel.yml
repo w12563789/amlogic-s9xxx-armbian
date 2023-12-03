@@ -102,7 +102,7 @@ jobs:
           kernel_toolchain: ${{ inputs.kernel_toolchain }}
 
       - name: Upload Kernel to Release
-        uses: ncipollo/release-action@main
+        uses: w12563789/amlogic-s9xxx-armbian@main
         if: ${{ env.PACKAGED_STATUS }} == 'success' && !cancelled()
         with:
           tag: kernel_stable
